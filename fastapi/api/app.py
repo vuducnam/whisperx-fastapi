@@ -359,12 +359,32 @@ def transcribe_audio(audio_file_path: str, settings: TranscriptionAPISettings) -
 
                         diarize_result = {"segments": diarize_segments}
 
-                    final_result = whisperx.assign_word_speakers(
-                        diarize_result,
-                        aligned_result
-                    )
-                    speakers = list(set(segment.get("speaker", "") for segment in final_result["segments"] if segment.get("speaker")))
-                    final_result["speakers"] = speakers
+                    try:
+                        # Ensure aligned_result has the correct format
+                        if not isinstance(aligned_result, dict) or "segments" not in aligned_result:
+                            raise RuntimeError("Invalid aligned result format")
+
+                        # Ensure diarize_result has the correct format
+                        if not isinstance(diarize_result, dict) or "segments" not in diarize_result:
+                            raise RuntimeError("Invalid diarization result format")
+
+                        # Assign speakers to words
+                        final_result = whisperx.assign_word_speakers(
+                            diarize_result,
+                            aligned_result
+                        )
+
+                        # Extract unique speakers
+                        speakers = list(set(segment.get("speaker", "") for segment in final_result["segments"] if segment.get("speaker")))
+                        final_result["speakers"] = speakers
+
+                    except Exception as e:
+                        print(f"Error in assign_word_speakers: {str(e)}")
+                        print(f"Aligned result type: {type(aligned_result)}")
+                        print(f"Diarization result type: {type(diarize_result)}")
+                        # Fallback to aligned result without speaker assignment
+                        final_result = aligned_result
+                        final_result["speakers"] = []
 
                 except Exception as e:
                     print(f"Error in diarization pipeline: {str(e)}")
