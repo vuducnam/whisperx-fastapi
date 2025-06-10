@@ -331,29 +331,36 @@ def transcribe_audio(audio_file_path: str, settings: TranscriptionAPISettings) -
                         torchaudio.save(audio_file_path, waveform, sample_rate)
 
                     # Run diarization
-                    diarize_segments = whisperx_models.diarize_pipeline(
+                    diarize_result = whisperx_models.diarize_pipeline(
                         audio_file_path,
                         min_speakers=1,
                         max_speakers=10
                     )
 
-                    if not diarize_segments:
+                    if not diarize_result:
                         raise RuntimeError("Diarization returned empty result")
 
-                    # Convert diarization result to the format expected by whisperx
-                    diarize_segments = {
-                        "segments": [
-                            {
-                                "start": segment["start"],
-                                "end": segment["end"],
-                                "speaker": segment["label"]
-                            }
-                            for segment in diarize_segments
-                        ]
-                    }
+                    # Check if result is already in the correct format
+                    if isinstance(diarize_result, dict) and "segments" in diarize_result:
+                        # Result is already in the correct format
+                        pass
+                    else:
+                        # Convert diarization result to the format expected by whisperx
+                        diarize_segments = []
+                        for segment, track, speaker in diarize_result.itertracks(yield_label=True):
+                            diarize_segments.append({
+                                "start": float(segment.start),
+                                "end": float(segment.end),
+                                "speaker": f"SPEAKER_{speaker}"
+                            })
+
+                        if not diarize_segments:
+                            raise RuntimeError("No valid segments found in diarization result")
+
+                        diarize_result = {"segments": diarize_segments}
 
                     final_result = whisperx.assign_word_speakers(
-                        diarize_segments,
+                        diarize_result,
                         aligned_result
                     )
                     speakers = list(set(segment.get("speaker", "") for segment in final_result["segments"] if segment.get("speaker")))
@@ -361,6 +368,9 @@ def transcribe_audio(audio_file_path: str, settings: TranscriptionAPISettings) -
 
                 except Exception as e:
                     print(f"Error in diarization pipeline: {str(e)}")
+                    print(f"Diarization result type: {type(diarize_result)}")
+                    if isinstance(diarize_result, (list, dict)):
+                        print(f"Diarization result: {diarize_result}")
                     raise RuntimeError(f"Diarization pipeline error: {str(e)}")
 
             except Exception as e:
