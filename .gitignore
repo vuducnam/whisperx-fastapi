@@ -1,0 +1,8 @@
+whisperx.egg-info/
+**/__pycache__/
+.ipynb_checkpoints
+
+venv
+.idea
+fastapi/env/.env.cuda
+fastapi/tmp

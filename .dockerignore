@@ -1,0 +1,12 @@
+fastapi/env
+venv
+.github
+figures
+whisperx.egg-info
+**/__pycache__
+
+fastapi/README.md
+.ipynb_checkpoints
+EXAMPLES.md
+LICENSE
+README.md
