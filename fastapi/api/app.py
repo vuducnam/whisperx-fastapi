@@ -21,6 +21,9 @@ from streaming_form_data.validators import MaxSizeValidator
 import whisperx
 import torch
 from pyannote.audio import Pipeline
+import subprocess
+import numpy as np
+import torchaudio
 
 
 class TranscriptionResponse(BaseModel):
@@ -41,14 +44,6 @@ class TranscriptionResult(BaseModel):
     speakers: Optional[list] = Field(None, description="List of detected speakers (if diarization is enabled)")
 
 
-@dataclass
-class WhisperXModels:
-    whisper_model: Any
-    diarize_pipeline: Any
-    align_model: Any
-    align_model_metadata: Any
-
-
 class TranscriptionAPISettings(BaseSettings):
     tmp_dir: str = 'tmp'
     cors_origins: str = '*'
@@ -67,10 +62,54 @@ class TranscriptionAPISettings(BaseSettings):
     max_request_body_size_mb: int = 5000
     model_loading_retries: int = 3
     model_loading_retry_delay: int = 5
+    supported_audio_formats: set = {'wav', 'mp3', 'm4a', 'ogg', 'flac'}
+    supported_sampling_rates: set = {8000, 16000, 22050, 24000, 32000, 44100, 48000}
+    default_sampling_rate: int = 16000
+    default_channels: int = 1
+    default_audio_format: str = 'wav'
 
     class Config:
         env_file = 'env/.env.cuda'
         env_file_encoding = 'utf-8'
+
+
+@dataclass
+class WhisperXModels:
+    whisper_model: Any = None
+    diarize_pipeline: Any = None
+    align_model: Any = None
+    align_model_metadata: Any = None
+
+    def is_ready(self) -> bool:
+        return self.whisper_model is not None
+
+    def load_models(self, settings: 'TranscriptionAPISettings') -> None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        # Load Whisper model
+        self.whisper_model = whisperx.load_model(
+            settings.whisper_model,
+            settings.device,
+            compute_type=settings.compute_type,
+            language=settings.language_code if settings.language_code != "auto" else None
+        )
+
+        # Load alignment model if language is specified
+        if settings.language_code != "auto":
+            self.align_model, self.align_model_metadata = whisperx.load_align_model(
+                language_code=settings.language_code,
+                device=settings.device
+            )
+
+        # Load diarization pipeline if HF token is provided
+        if settings.hf_api_key:
+            self.diarize_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization",
+                use_auth_token=settings.hf_api_key
+            ).to(torch.device(settings.device))
 
 
 class MaxBodySizeException(Exception):
@@ -140,12 +179,7 @@ async def get_open_api_endpoint():
 trancription_tasks = {}
 trancription_tasks_queue = Queue()
 
-whisperx_models = WhisperXModels(
-    whisper_model=None,
-    diarize_pipeline=None,
-    align_model=None,
-    align_model_metadata=None
-)
+whisperx_models = WhisperXModels()
 
 
 def load_whisperx_models() -> None:
@@ -198,57 +232,169 @@ def load_whisperx_models() -> None:
                 raise RuntimeError(f"Failed to load WhisperX models after {settings.model_loading_retries} attempts: {str(e)}")
 
 
-def transcribe_audio(audio_file_path: str) -> dict:
+def convert_audio(input_path: str, output_path: str, settings: TranscriptionAPISettings) -> None:
+    try:
+        result = subprocess.run([
+            'ffmpeg', '-i', input_path,
+            '-acodec', 'pcm_s16le',
+            '-ar', str(settings.default_sampling_rate),
+            '-ac', str(settings.default_channels),
+            output_path
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Failed to convert audio: {e.stderr}")
+    except Exception as e:
+        raise RuntimeError(f"Error converting audio: {str(e)}")
+
+
+def load_audio_file(file_path: str, settings: TranscriptionAPISettings) -> np.ndarray:
+    try:
+        audio = whisperx.load_audio(file_path)
+        if audio is None or len(audio) == 0:
+            raise RuntimeError("Failed to load audio: Empty audio data")
+        return audio
+    except Exception as e:
+        raise RuntimeError(f"Failed to load audio: {str(e)}")
+
+
+def transcribe_audio(audio_file_path: str, settings: TranscriptionAPISettings) -> dict:
     global whisperx_models
 
-    # Load audio
-    audio = whisperx.load_audio(audio_file_path)
+    if not whisperx_models.is_ready():
+        raise RuntimeError("WhisperX models are not loaded")
 
-    # Transcribe with Whisper
-    transcription_result = whisperx_models.whisper_model.transcribe(
-        audio,
-        batch_size=int(settings.batch_size),
-    )
+    try:
+        # Convert audio if needed
+        if not audio_file_path.lower().endswith(settings.default_audio_format):
+            wav_path = f"{audio_file_path.rsplit('.', 1)[0]}.{settings.default_audio_format}"
+            convert_audio(audio_file_path, wav_path, settings)
+            audio_file_path = wav_path
 
-    # Auto-detect language if not specified
-    if settings.language_code == "auto":
-        language = transcription_result["language"]
-        (
+        # Load audio
+        audio = load_audio_file(audio_file_path, settings)
+
+        # Transcribe with Whisper
+        transcription_result = whisperx_models.whisper_model.transcribe(
+            audio,
+            batch_size=settings.batch_size,
+        )
+
+        if not transcription_result or "segments" not in transcription_result:
+            raise RuntimeError("Invalid transcription result: Missing segments")
+
+        # Auto-detect language if not specified
+        if settings.language_code == "auto":
+            language = transcription_result["language"]
+            whisperx_models.align_model, whisperx_models.align_model_metadata = whisperx.load_align_model(
+                language_code=language,
+                device=settings.device
+            )
+
+        # Align whisper output
+        aligned_result = whisperx.align(
+            transcription_result["segments"],
             whisperx_models.align_model,
-            whisperx_models.align_model_metadata
-        ) = whisperx.load_align_model(
-            language_code=language,
-            device=settings.device
+            whisperx_models.align_model_metadata,
+            audio,
+            settings.device,
+            return_char_alignments=False
         )
 
-    # Align whisper output
-    aligned_result = whisperx.align(
-        transcription_result["segments"],
-        whisperx_models.align_model,
-        whisperx_models.align_model_metadata,
-        audio,
-        settings.device,
-        return_char_alignments=False
-    )
+        # Diarize if HF token is provided
+        if settings.hf_api_key and whisperx_models.diarize_pipeline:
+            try:
+                # Ensure file exists and is readable
+                if not os.path.exists(audio_file_path):
+                    raise RuntimeError(f"Audio file not found: {audio_file_path}")
+                
+                if not os.access(audio_file_path, os.R_OK):
+                    raise RuntimeError(f"Audio file not readable: {audio_file_path}")
 
-    # Diarize if HF token is provided
-    if settings.hf_api_key and whisperx_models.diarize_pipeline:
-        diarize_segments = whisperx_models.diarize_pipeline(audio_file_path)
-        final_result = whisperx.assign_word_speakers(
-            diarize_segments,
-            aligned_result
-        )
-        # Extract unique speakers
-        speakers = list(set(segment.get("speaker", "") for segment in final_result["segments"] if segment.get("speaker")))
-        final_result["speakers"] = speakers
-    else:
-        final_result = aligned_result
-        final_result["speakers"] = []
+                # Get file info
+                file_size = os.path.getsize(audio_file_path)
+                if file_size == 0:
+                    raise RuntimeError(f"Audio file is empty: {audio_file_path}")
 
-    # Add language to final result
-    final_result["language"] = transcription_result["language"]
-    
-    return final_result
+                # Try to load audio with torchaudio first to validate
+                try:
+                    waveform, sample_rate = torchaudio.load(audio_file_path)
+                    if waveform.numel() == 0:
+                        raise RuntimeError(f"Invalid audio data in file: {audio_file_path}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load audio with torchaudio: {str(e)}")
+
+                # Perform diarization with error handling
+                try:
+                    # Convert audio to mono if needed
+                    if waveform.shape[0] > 1:
+                        waveform = torch.mean(waveform, dim=0, keepdim=True)
+                        torchaudio.save(audio_file_path, waveform, sample_rate)
+
+                    # Run diarization
+                    diarize_segments = whisperx_models.diarize_pipeline(
+                        audio_file_path,
+                        min_speakers=1,
+                        max_speakers=10
+                    )
+
+                    if not diarize_segments:
+                        raise RuntimeError("Diarization returned empty result")
+
+                    # Convert diarization result to the format expected by whisperx
+                    diarize_segments = {
+                        "segments": [
+                            {
+                                "start": segment["start"],
+                                "end": segment["end"],
+                                "speaker": segment["label"]
+                            }
+                            for segment in diarize_segments
+                        ]
+                    }
+
+                    final_result = whisperx.assign_word_speakers(
+                        diarize_segments,
+                        aligned_result
+                    )
+                    speakers = list(set(segment.get("speaker", "") for segment in final_result["segments"] if segment.get("speaker")))
+                    final_result["speakers"] = speakers
+
+                except Exception as e:
+                    print(f"Error in diarization pipeline: {str(e)}")
+                    raise RuntimeError(f"Diarization pipeline error: {str(e)}")
+
+            except Exception as e:
+                print(f"Error in diarization: {str(e)}")
+                print(f"Audio file path: {audio_file_path}")
+                print(f"File exists: {os.path.exists(audio_file_path)}")
+                if os.path.exists(audio_file_path):
+                    print(f"File size: {os.path.getsize(audio_file_path)} bytes")
+                final_result = aligned_result
+                final_result["speakers"] = []
+        else:
+            final_result = aligned_result
+            final_result["speakers"] = []
+
+        final_result["language"] = transcription_result["language"]
+
+        # Clean up temporary file after all processing is done
+        if audio_file_path.endswith(settings.default_audio_format) and os.path.exists(audio_file_path):
+            try:
+                os.remove(audio_file_path)
+            except Exception as e:
+                print(f"Error removing temporary file: {str(e)}")
+
+        return final_result
+
+    except Exception as e:
+        # Clean up temporary file in case of error
+        if audio_file_path.endswith(settings.default_audio_format) and os.path.exists(audio_file_path):
+            try:
+                os.remove(audio_file_path)
+            except Exception as e:
+                print(f"Error removing temporary file: {str(e)}")
+        print(f"Error in transcribe_audio: {str(e)}")
+        raise RuntimeError(f"Transcription failed: {str(e)}")
 
 
 def transcription_worker() -> None:
@@ -256,19 +402,72 @@ def transcription_worker() -> None:
         task_id, tmp_path = trancription_tasks_queue.get()
 
         try:
-            result = transcribe_audio(tmp_path)
-            trancription_tasks[task_id].update({"status": "completed", "result": result})
+            # Update status to processing
+            trancription_tasks[task_id].update({
+                "status": "processing"
+            })
+
+            # Process audio
+            result = transcribe_audio(tmp_path, settings)
+            
+            # Update task with success
+            trancription_tasks[task_id].update({
+                "status": "completed",
+                "result": result
+            })
 
         except Exception as e:
-            trancription_tasks[task_id].update({"status": "failed", "result": str(e)})
+            print(f"Error processing task {task_id}: {str(e)}")
+            # Update task with failure but don't raise error
+            trancription_tasks[task_id].update({
+                "status": "failed",
+                "result": {
+                    "segments": [],
+                    "language": "unknown",
+                    "speakers": []
+                }
+            })
 
         finally:
             trancription_tasks_queue.task_done()
-            os.remove(tmp_path)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception as e:
+                    print(f"Error removing temporary file {tmp_path}: {str(e)}")
+
+
+def check_ffmpeg():
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("FFmpeg is not installed or not working properly")
+        print("FFmpeg is installed and working properly")
+        version_line = result.stdout.split('\n')[0]
+        print(f"FFmpeg version: {version_line}")
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg is not installed. Please install FFmpeg first")
+    except Exception as e:
+        raise RuntimeError(f"Error checking FFmpeg: {str(e)}")
 
 
 @app.on_event("startup")
-async def startup_event() -> None:
+async def startup_event():
+    global whisperx_models
+    try:
+        # Check FFmpeg first
+        check_ffmpeg()
+        
+        # Initialize models
+        whisperx_models = WhisperXModels()
+        whisperx_models.load_models(settings)
+            
+        print("All models loaded successfully")
+        
+    except Exception as e:
+        print(f"Error during startup: {str(e)}")
+        raise
+
     os.makedirs(settings.tmp_dir, exist_ok=True)
     load_whisperx_models()
     Thread(target=transcription_worker, daemon=True).start()
@@ -350,7 +549,11 @@ async def get_task_status(task_id: str) -> dict:
         "task_id": task_id,
         "status": task["status"],
         "creation_time": task["creation_time"],
-        "result": task["result"]
+        "result": task.get("result", {
+            "segments": [],
+            "language": "unknown",
+            "speakers": []
+        })
     }
 
 
@@ -369,44 +572,30 @@ async def get_task_result(task_id: str) -> dict:
         )
 
     task = trancription_tasks[task_id]
-    if task["status"] != "completed":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Task is not completed. Current status: {task['status']}"
-        )
-
-    if not task["result"]:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Task completed but no result available"
-        )
-
-    result = task["result"]
     
-    # Ensure result is a dictionary
-    if not isinstance(result, dict):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Invalid result format: {type(result)}"
-        )
-
-    # Extract segments and ensure they are in the correct format
-    segments = result.get("segments", [])
-    if not isinstance(segments, list):
-        segments = []
-
-    # Extract language
-    language = result.get("language", "unknown")
-    if not isinstance(language, str):
-        language = "unknown"
-
-    # Extract speakers
-    speakers = result.get("speakers", [])
-    if not isinstance(speakers, list):
-        speakers = []
-
+    # If task is still processing, return current status
+    if task["status"] in ["loading", "processing"]:
+        return {
+            "segments": [],
+            "language": "unknown",
+            "speakers": []
+        }
+    
+    # If task failed, return empty result
+    if task["status"] == "failed":
+        return {
+            "segments": [],
+            "language": "unknown",
+            "speakers": []
+        }
+    
+    # If task completed, return result
+    if task["status"] == "completed" and "result" in task:
+        return task["result"]
+    
+    # Default case: return empty result
     return {
-        "segments": segments,
-        "language": language,
-        "speakers": speakers
+        "segments": [],
+        "language": "unknown",
+        "speakers": []
     }
