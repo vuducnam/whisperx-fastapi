@@ -19,6 +19,7 @@ FastAPI implementation for WhisperX speech recognition with GPU support.
 - NVIDIA drivers
 - cuBLAS 11.x
 - cuDNN 8.x
+- Hugging Face account (for speaker diarization)
 
 ## Installation
 
@@ -80,6 +81,18 @@ MODEL_LOADING_RETRIES=3
 MODEL_LOADING_RETRY_DELAY=5
 ```
 
+### Getting Hugging Face Token (Optional)
+
+To enable speaker diarization:
+
+1. Create a free account at https://huggingface.co
+2. Go to Settings -> Access Tokens
+3. Create a new token
+4. Accept the terms of use for the diarization model at https://huggingface.co/pyannote/speaker-diarization
+5. Add your token to the `HF_API_KEY` in `.env.cuda`
+
+Note: The free token is sufficient for personal use. The diarization model only needs to be downloaded once and will be cached locally.
+
 ## Running FastAPI
 
 ### Local Development
@@ -125,7 +138,7 @@ GET /transcribe/status/{task_id}
 GET /transcribe/result/{task_id}
 ```
 - Get the transcription result
-- Returns segments, language, and speaker information
+- Returns segments, language, and speaker information (if diarization is enabled)
 
 ## Response Formats
 
@@ -155,11 +168,11 @@ GET /transcribe/result/{task_id}
             "start": "float",
             "end": "float",
             "text": "string",
-            "speaker": "string"
+            "speaker": "string"  // Only available if diarization is enabled
         }
     ],
     "language": "string",
-    "speakers": ["string"]
+    "speakers": ["string"]  // Only available if diarization is enabled
 }
 ```
 
@@ -179,10 +192,10 @@ GET /transcribe/result/{task_id}
 
 - Current implementation only supports GPU
 - CPU support is planned for future releases
-- Speaker diarization requires a Hugging Face API token
+- Speaker diarization is optional and requires a free Hugging Face token
 - Maximum file size is configurable (default: 4GB)
 - Tasks are automatically cleaned up after 60 minutes
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request. 

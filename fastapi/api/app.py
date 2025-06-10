@@ -238,8 +238,12 @@ def transcribe_audio(audio_file_path: str) -> dict:
             diarize_segments,
             aligned_result
         )
+        # Extract unique speakers
+        speakers = list(set(segment.get("speaker", "") for segment in final_result["segments"] if segment.get("speaker")))
+        final_result["speakers"] = speakers
     else:
         final_result = aligned_result
+        final_result["speakers"] = []
 
     # Add language to final result
     final_result["language"] = transcription_result["language"]
