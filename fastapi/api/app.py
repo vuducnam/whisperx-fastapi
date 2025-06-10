@@ -383,8 +383,30 @@ async def get_task_result(task_id: str) -> dict:
 
     result = task["result"]
     
+    # Ensure result is a dictionary
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Invalid result format: {type(result)}"
+        )
+
+    # Extract segments and ensure they are in the correct format
+    segments = result.get("segments", [])
+    if not isinstance(segments, list):
+        segments = []
+
+    # Extract language
+    language = result.get("language", "unknown")
+    if not isinstance(language, str):
+        language = "unknown"
+
+    # Extract speakers
+    speakers = result.get("speakers", [])
+    if not isinstance(speakers, list):
+        speakers = []
+
     return {
-        "segments": result.get("segments", []),
-        "language": result.get("language", "unknown"),
-        "speakers": result.get("speakers", [])
+        "segments": segments,
+        "language": language,
+        "speakers": speakers
     }
